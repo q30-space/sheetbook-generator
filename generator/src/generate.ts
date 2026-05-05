@@ -2,6 +2,7 @@ import { dir, DirectoryResult, file, FileResult } from "tmp-promise";
 import { globby } from "zx";
 import { BLANK, concatPdfsToPortraitA4WithPageNumbers, convertOdToPdf, convertSvgToPdf, cropPdfToContent, getNumberOfPages, packTunesIntoPages, scalePdfToA4, scalePdfToA5Booklet, scalePdfToA6Booklet } from "./convert";
 import { promises as fs } from "fs";
+import path from "path";
 import dayjs from "dayjs";
 import { getCommitId } from "./git";
 import { TUNES_AFTER, TUNES_BEFORE, TEMP_OPTIONS, TUNE_SETS, FRONT, BACK, TUNE_DISPLAY_NAME } from "../../config";
@@ -114,63 +115,97 @@ async function generateFilteredBooklet(
     const resolvedTunes = resolveTuneSet(spec.tunes, existingTunes);
     const selected = new Set<CanonicalInstrument>(spec.instruments as CanonicalInstrument[]);
 
-    // 1. Filter each tune's ODS into a temp dir.
+    // 1. Stage each tune's source file. Filter .ods files row-by-row; copy .odt
+    //    text-only files through unchanged (no instrument structure to filter).
+    //    Tunes the filter passes through whole (reference docs like breaks.ods,
+    //    dances.ods) are tracked so we don't squash their multi-page layout in step 3.
     const filteredOdsDir = await dir({ ...TEMP_OPTIONS, postfix: 'filtered-ods', unsafeCleanup: true });
     const survivingTunes: string[] = [];
-    const filteredOdsPaths: string[] = [];
+    const passThroughTunes = new Set<string>();
+    const filteredOdPaths: string[] = [];
     for (const tune of resolvedTunes) {
-        const inputResult = await globby(`${inDir}/${tune}.ods`);
-        if (inputResult.length !== 1) continue;  // .odt files (text-only) don't have instrument rows; skip filtering
-        const inputOds = inputResult[0];
-        const outputOds = `${filteredOdsDir.path}/${tune}.ods`;
-        const result = await filterOdsByInstruments(inputOds, outputOds, selected);
-        if (result.unknownLabels.length > 0) {
-            console.log(`[filter] ${tune}: unknown column-A labels (kept as 'other'): ${result.unknownLabels.join(', ')}`);
-        }
-        if (result.keptInstrumentRows === 0 && result.keptBreakRows === 0) {
-            console.log(`[filter] dropping ${tune} — no instrument rows match selection and no break sections`);
-            continue;
+        const inputResult = await globby(`${inDir}/${tune}.od{s,t}`);
+        if (inputResult.length !== 1) continue;
+        const inputFile = inputResult[0];
+        const ext = path.extname(inputFile);
+        const outputFile = `${filteredOdsDir.path}/${tune}${ext}`;
+
+        if (ext === '.odt') {
+            await fs.copyFile(inputFile, outputFile);
+            passThroughTunes.add(tune);
+        } else {
+            const result = await filterOdsByInstruments(inputFile, outputFile, selected);
+            if (result.unknownLabels.length > 0) {
+                console.log(`[filter] ${tune}: unknown column-A labels (kept as 'other'): ${result.unknownLabels.join(', ')}`);
+            }
+            if (result.passedThrough) {
+                passThroughTunes.add(tune);
+            } else if (result.keptInstrumentRows === 0 && result.keptBreakRows === 0) {
+                console.log(`[filter] dropping ${tune} — no instrument rows match selection and no break sections`);
+                continue;
+            }
         }
         survivingTunes.push(tune);
-        filteredOdsPaths.push(outputOds);
+        filteredOdPaths.push(outputFile);
     }
 
     if (survivingTunes.length === 0) {
         throw new Error("Instrument filter eliminated every tune. Try selecting more instruments.");
     }
 
-    // 2. Convert filtered ODS files to PDFs.
+    // 2. Convert all staged files to PDF.
     const tunePdfsDir = await dir({ ...TEMP_OPTIONS, postfix: 'filtered-pdfs', unsafeCleanup: true });
-    await convertOdToPdf(filteredOdsPaths, tunePdfsDir.path);
+    await convertOdToPdf(filteredOdPaths, tunePdfsDir.path);
 
-    // 3. Crop each PDF to its actual content (removes blank tail from row deletion).
-    const croppedPdfs: string[] = [];
+    // 3. Build assembly segments. Pass-through tunes (multi-page reference docs)
+    //    are appended whole — packTunesIntoPages uses \includegraphics which
+    //    silently keeps only page 1, so we must keep them out of the pack step.
+    //    Adjacent filterable tunes are cropped and grouped into a single packed
+    //    segment so several short per-instrument sheets share a page.
     const sortedTunes = sortTunes(new Set(survivingTunes));
+    const segments: string[] = [];
+    const tempPackedFiles: FileResult[] = [];
+    let packChunk: string[] = [];
+
+    const flushPackChunk = async () => {
+        if (packChunk.length === 0) return;
+        const packed = await file({ ...TEMP_OPTIONS, postfix: 'packed.pdf' });
+        tempPackedFiles.push(packed);
+        await packTunesIntoPages(packChunk, spec.format, packed.path);
+        segments.push(packed.path);
+        packChunk = [];
+    };
+
     for (const tune of sortedTunes) {
         const src = `${tunePdfsDir.path}/${tune}.pdf`;
-        const dst = `${tunePdfsDir.path}/${tune}-cropped.pdf`;
-        await cropPdfToContent(src, dst);
-        croppedPdfs.push(dst);
+        if (passThroughTunes.has(tune)) {
+            await flushPackChunk();
+            segments.push(src);
+        } else {
+            const cropped = `${tunePdfsDir.path}/${tune}-cropped.pdf`;
+            await cropPdfToContent(src, cropped);
+            packChunk.push(cropped);
+        }
     }
+    await flushPackChunk();
 
-    // 4. Pack multiple cropped tunes onto pages of the target booklet's tune-page size.
-    const packedPdf = await file({ ...TEMP_OPTIONS, postfix: 'packed.pdf' });
-    await packTunesIntoPages(croppedPdfs, spec.format, packedPdf.path);
-
-    // 5. Build covers — show the tune list without per-tune page numbers.
+    // 4. Build covers — show the tune list without per-tune page numbers.
     const indexEntries = sortedTunes.map((t) => ({ displayName: TUNE_DISPLAY_NAME(t), page: '' }));
     const frontPdf = await generateCoverPdf(inDir, FRONT(spec, existingTunes), spec.tunes, indexEntries, commitId);
     const backPdf = await generateCoverPdf(inDir, BACK(spec, existingTunes), spec.tunes, indexEntries, commitId);
 
-    // 6. Assemble [front, packed, blanks..., back] and add blanks to satisfy booklet binding.
-    const packedPages = await getNumberOfPages(packedPdf.path);
+    // 5. Assemble [front, ...segments, blanks..., back] and add blanks to satisfy booklet binding.
+    let segmentsTotalPages = 0;
+    for (const seg of segments) {
+        segmentsTotalPages += await getNumberOfPages(seg);
+    }
     const target = spec.format === SheetFormat.A4 ? 2 : 4;
-    const totalIncludingCovers = packedPages + 2;
+    const totalIncludingCovers = segmentsTotalPages + 2;
     const blanksNeeded = (target - (totalIncludingCovers % target)) % target;
 
-    const files: string[] = [frontPdf.path, packedPdf.path, ...new Array(blanksNeeded).fill(BLANK), backPdf.path];
+    const files: string[] = [frontPdf.path, ...segments, ...new Array(blanksNeeded).fill(BLANK), backPdf.path];
 
-    // 7. Concatenate and impose using existing pipeline.
+    // 6. Concatenate and impose using existing pipeline.
     if (spec.format === SheetFormat.A4) {
         await concatPdfsToPortraitA4WithPageNumbers(files, spec.outFile);
     } else {
@@ -189,7 +224,7 @@ async function generateFilteredBooklet(
         await Promise.all([
             frontPdf.cleanup(),
             backPdf.cleanup(),
-            packedPdf.cleanup(),
+            ...tempPackedFiles.map((p) => p.cleanup()),
             tunePdfsDir.cleanup(),
             filteredOdsDir.cleanup()
         ]);

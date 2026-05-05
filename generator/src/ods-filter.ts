@@ -10,13 +10,16 @@ export interface FilterResult {
     keptBreakRows: number;
     /** Column-A labels we couldn't classify; useful for catching new instrument variants. */
     unknownLabels: string[];
+    /** True if the file was copied through unchanged (reference content with no instrument structure). */
+    passedThrough?: boolean;
 }
 
 /**
- * Filename of the special index ODS that holds break patterns rather than per-instrument
- * sheet content. We never filter this file — it isn't structured as instrument rows.
+ * Filenames of special reference ODS files that hold break/sign content rather than
+ * per-instrument sheet rows. We never filter these — column A is descriptive text,
+ * not instrument labels, so the row classifier would drop them entirely.
  */
-const BREAKS_FILENAME = 'breaks.ods';
+const PASS_THROUGH_FILENAMES = new Set(['breaks.ods', 'breaks_large.ods', 'dances.ods']);
 
 /**
  * Read an ODS, delete the table-rows whose first cell labels an instrument that
@@ -34,9 +37,9 @@ export async function filterOdsByInstruments(
     outputOdsPath: string,
     selected: Set<CanonicalInstrument>
 ): Promise<FilterResult> {
-    if (path.basename(inputOdsPath) === BREAKS_FILENAME) {
+    if (PASS_THROUGH_FILENAMES.has(path.basename(inputOdsPath))) {
         await fs.copyFile(inputOdsPath, outputOdsPath);
-        return { keptInstrumentRows: 0, keptBreakRows: 0, unknownLabels: [] };
+        return { keptInstrumentRows: 0, keptBreakRows: 0, unknownLabels: [], passedThrough: true };
     }
 
     const data = await fs.readFile(inputOdsPath);

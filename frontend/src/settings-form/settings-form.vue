@@ -48,6 +48,37 @@
 				</div>
 			</div>
 		</fieldset>
+
+		<fieldset class="row mb-3">
+			<legend class="col-form-label col-sm-2 pt-0">Instruments</legend>
+			<div class="col-sm-10">
+				<div class="form-check">
+					<input class="form-check-input" type="radio" id="rsg-settings-form-instruments-all" v-model="instrumentMode" value="all"/>
+					<label class="form-check-label" for="rsg-settings-form-instruments-all">All instruments</label>
+				</div>
+				<div class="form-check">
+					<input class="form-check-input" type="radio" id="rsg-settings-form-instruments-custom" v-model="instrumentMode" value="custom"/>
+					<label class="form-check-label" for="rsg-settings-form-instruments-custom">Custom selection</label>
+					<template v-if="instrumentMode === 'custom'">
+						&nbsp;
+						<a v-if="instruments.length > 0" href="javascript:" @click.prevent="instruments = []">Unselect all</a>
+						<a v-if="instruments.length === 0" href="javascript:" @click.prevent="selectAllInstruments">Select all</a>
+					</template>
+				</div>
+
+				<div class="rsg-checkbox-grid mt-4">
+					<div v-for="instrument in CANONICAL_INSTRUMENTS" class="form-check">
+						<input class="form-check-input" :id="`rsg-settings-form-instrument-${instrument}`" type="checkbox" :disabled="instrumentMode !== 'custom'" :value="instrument" v-model="instruments">
+						<label class="form-check-label" :for="`rsg-settings-form-instrument-${instrument}`">{{instrument}}</label>
+					</div>
+				</div>
+
+				<div v-if="instrumentMode === 'custom'" class="form-text mt-2">
+					Tunes that don't include any of the selected instruments will be skipped. The booklet
+					will be compacted, packing multiple short tunes per page.
+				</div>
+			</div>
+		</fieldset>
 	</template>
 	<template v-else>
 		<div class="row mb-3">

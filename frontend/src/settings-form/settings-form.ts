@@ -3,7 +3,7 @@ import Component from "vue-class-component";
 import WithRender from "./settings-form.vue";
 import { Prop, Ref, Watch } from "vue-property-decorator";
 import "./settings-form.scss";
-import { SheetbookRequestSpec, SheetFormat, SheetType } from "ror-sheetbook-common";
+import { CANONICAL_INSTRUMENTS, SheetbookRequestSpec, SheetFormat, SheetType } from "ror-sheetbook-common";
 import { Socket } from "../socket";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
@@ -29,7 +29,10 @@ export default class SettingsForm extends Vue {
 	tuneset: 'no-ca' | 'all' | 'ca-booklet' | 'custom' = 'no-ca';
 	tunes: string[] = [];
 	tune: string = 'breaks';
+	instrumentMode: 'all' | 'custom' = 'all';
+	instruments: string[] = [];
 	TUNE_SETS = TUNE_SETS;
+	CANONICAL_INSTRUMENTS = CANONICAL_INSTRUMENTS;
 
 	isSubmitting = false;
 	showLog = false;
@@ -69,6 +72,10 @@ export default class SettingsForm extends Vue {
 		this.tunes = this.socket.tunesInfo.existingTunes.map((t) => t.name);
 	}
 
+	selectAllInstruments(): void {
+		this.instruments = [...CANONICAL_INSTRUMENTS];
+	}
+
 	async submit(): Promise<void> {
 		if (this.isSubmitting) {
 			return;
@@ -79,6 +86,9 @@ export default class SettingsForm extends Vue {
 		this.showLog = true;
 
 		try {
+			const instruments = this.format !== 'single' && this.instrumentMode === 'custom' && this.instruments.length > 0
+				? this.instruments
+				: undefined;
 			const spec: SheetbookRequestSpec = this.format === 'single' ? {
 				type: SheetType.SINGLE,
 				tune: this.tune,
@@ -87,7 +97,8 @@ export default class SettingsForm extends Vue {
 				type: SheetType.BOOKLET,
 				format: this.format === 'booklet-a6' ? SheetFormat.A6 : this.format === 'booklet-a5' ? SheetFormat.A5 : SheetFormat.A4,
 				tunes: this.tuneset === 'custom' ? this.tunes : this.tuneset,
-				treeish: MAIN_BRANCH
+				treeish: MAIN_BRANCH,
+				...(instruments ? { instruments } : {})
 			};
 
 			const downloadPath = await this.socket.createSheet(spec);

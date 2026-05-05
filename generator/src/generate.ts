@@ -1,11 +1,12 @@
 import { dir, DirectoryResult, file, FileResult } from "tmp-promise";
 import { globby } from "zx";
-import { BLANK, concatPdfsToPortraitA4WithPageNumbers, convertOdToPdf, convertSvgToPdf, getNumberOfPages, scalePdfToA4, scalePdfToA5Booklet, scalePdfToA6Booklet } from "./convert";
+import { BLANK, concatPdfsToPortraitA4WithPageNumbers, convertOdToPdf, convertSvgToPdf, cropPdfToContent, getNumberOfPages, packTunesIntoPages, scalePdfToA4, scalePdfToA5Booklet, scalePdfToA6Booklet } from "./convert";
 import { promises as fs } from "fs";
 import dayjs from "dayjs";
 import { getCommitId } from "./git";
 import { TUNES_AFTER, TUNES_BEFORE, TEMP_OPTIONS, TUNE_SETS, FRONT, BACK, TUNE_DISPLAY_NAME } from "../../config";
-import { SheetbookSpec, SheetFormat, SheetType } from "ror-sheetbook-common";
+import { BookletSheetbookSpec, CanonicalInstrument, SheetbookSpec, SheetFormat, SheetType } from "ror-sheetbook-common";
+import { filterOdsByInstruments } from "./ods-filter";
 import { escape } from "lodash";
 
 /**
@@ -20,8 +21,13 @@ export async function generateSheets(inDir: string, specs: SheetbookSpec[]): Pro
     const existingTunes = needsExistingTunes ? await getExistingTunes(inDir) : [];
     const commitId = specs.some((spec) => spec.type === SheetType.BOOKLET) ? await getCommitId(inDir) : undefined;
 
-    const singleTunes = specs.flatMap((spec) => spec.type === SheetType.SINGLE ? [spec.tune] : spec.type === SheetType.MULTIPLE ? [...resolveTuneSet(spec.tunes, existingTunes)] : []);
-    const bookletTunes = specs.flatMap((spec) => spec.type === SheetType.BOOKLET ? [...resolveTuneSet(spec.tunes, existingTunes)] : []);
+    // Specs that filter by instrument run an entirely separate pipeline (filter ODS rows,
+    // crop blank tail, pack multiple short tunes per page) and don't share tune PDFs with
+    // the unfiltered specs. Skip them here; they're handled below.
+    const isFiltered = (spec: SheetbookSpec) => spec.instruments && spec.instruments.length > 0;
+    const unfilteredSpecs = specs.filter((spec) => !isFiltered(spec));
+    const singleTunes = unfilteredSpecs.flatMap((spec) => spec.type === SheetType.SINGLE ? [spec.tune] : spec.type === SheetType.MULTIPLE ? [...resolveTuneSet(spec.tunes, existingTunes)] : []);
+    const bookletTunes = unfilteredSpecs.flatMap((spec) => spec.type === SheetType.BOOKLET ? [...resolveTuneSet(spec.tunes, existingTunes)] : []);
 
     const tunePdfs = await generateTunePdfs(inDir, new Set([...singleTunes, ...bookletTunes]));
     const pageNumbers = await getPageNumbers(tunePdfs, new Set([...bookletTunes]));
@@ -34,37 +40,10 @@ export async function generateSheets(inDir: string, specs: SheetbookSpec[]): Pro
                 await scalePdfToA4(`${tunePdfs.path}/${tune}.pdf`, `${spec.outDir}/${tune}.pdf`);
             }
         } else if (spec.type === SheetType.BOOKLET) {
-            const resolvedTunes = resolveTuneSet(spec.tunes, existingTunes);
-            const orderedTunes = orderTunes(resolvedTunes, pageNumbers, spec.format);
-            const frontPdf = await generateFrontOrBackPdf(inDir, FRONT(spec, existingTunes), spec.tunes, orderedTunes, pageNumbers, commitId!);
-            const backPdf = await generateFrontOrBackPdf(inDir, BACK(spec, existingTunes), spec.tunes, orderedTunes, pageNumbers, commitId!);
-            const files = [
-                frontPdf.path,
-                ...orderedTunes.map((tune) => tune === BLANK ? BLANK : `${tunePdfs.path}/${tune}.pdf`),
-                backPdf.path
-            ];
-
-            if (spec.format === SheetFormat.A4) {
-                await concatPdfsToPortraitA4WithPageNumbers(files, spec.outFile);
-            } else if (spec.format === SheetFormat.A5 || spec.format === SheetFormat.A6) {
-                const a4BookletPdf = await file({ ...TEMP_OPTIONS, postfix: 'a4.pdf' });
-                await concatPdfsToPortraitA4WithPageNumbers(files, a4BookletPdf.path);
-                try {
-                    await (spec.format === SheetFormat.A5 ? scalePdfToA5Booklet : scalePdfToA6Booklet)(a4BookletPdf.path, spec.outFile);
-                } finally {
-                    if (!process.env.KEEP_TEMP) {
-                        await a4BookletPdf.cleanup();
-                    }
-                }
+            if (isFiltered(spec)) {
+                await generateFilteredBooklet(inDir, spec, existingTunes, commitId!);
             } else {
-                throw new Error(`Unknown format: ${spec.format}`);
-            }
-
-            if (!process.env.KEEP_TEMP) {
-                await Promise.all([
-                    frontPdf.cleanup(),
-                    backPdf.cleanup()
-                ]);
+                await generateUnfilteredBooklet(inDir, spec, existingTunes, tunePdfs, pageNumbers, commitId!);
             }
         } else {
             throw new Error(`Unknown sheet type: ${(spec as any).type}`);
@@ -73,6 +52,147 @@ export async function generateSheets(inDir: string, specs: SheetbookSpec[]): Pro
 
     if (!process.env.KEEP_TEMP) {
         await tunePdfs.cleanup();
+    }
+}
+
+async function generateUnfilteredBooklet(
+    inDir: string,
+    spec: BookletSheetbookSpec,
+    existingTunes: string[],
+    tunePdfs: DirectoryResult,
+    pageNumbers: Map<string, number>,
+    commitId: string
+): Promise<void> {
+    const resolvedTunes = resolveTuneSet(spec.tunes, existingTunes);
+    const orderedTunes = orderTunes(resolvedTunes, pageNumbers, spec.format);
+    const frontPdf = await generateFrontOrBackPdf(inDir, FRONT(spec, existingTunes), spec.tunes, orderedTunes, pageNumbers, commitId);
+    const backPdf = await generateFrontOrBackPdf(inDir, BACK(spec, existingTunes), spec.tunes, orderedTunes, pageNumbers, commitId);
+    const files = [
+        frontPdf.path,
+        ...orderedTunes.map((tune) => tune === BLANK ? BLANK : `${tunePdfs.path}/${tune}.pdf`),
+        backPdf.path
+    ];
+
+    if (spec.format === SheetFormat.A4) {
+        await concatPdfsToPortraitA4WithPageNumbers(files, spec.outFile);
+    } else if (spec.format === SheetFormat.A5 || spec.format === SheetFormat.A6) {
+        const a4BookletPdf = await file({ ...TEMP_OPTIONS, postfix: 'a4.pdf' });
+        await concatPdfsToPortraitA4WithPageNumbers(files, a4BookletPdf.path);
+        try {
+            await (spec.format === SheetFormat.A5 ? scalePdfToA5Booklet : scalePdfToA6Booklet)(a4BookletPdf.path, spec.outFile);
+        } finally {
+            if (!process.env.KEEP_TEMP) {
+                await a4BookletPdf.cleanup();
+            }
+        }
+    } else {
+        throw new Error(`Unknown format: ${spec.format}`);
+    }
+
+    if (!process.env.KEEP_TEMP) {
+        await Promise.all([
+            frontPdf.cleanup(),
+            backPdf.cleanup()
+        ]);
+    }
+}
+
+/**
+ * Filtered-booklet pipeline. Filters each tune ODS to the requested instruments, drops
+ * tunes with neither instrument rows nor breaks, crops each PDF to its actual content,
+ * packs multiple short tunes per page, then runs the existing booklet imposition.
+ *
+ * The cover index lists the tunes that are present but does not include page numbers,
+ * since LaTeX's flow decides packing and tune-to-page mapping is no longer 1:1.
+ */
+async function generateFilteredBooklet(
+    inDir: string,
+    spec: BookletSheetbookSpec,
+    existingTunes: string[],
+    commitId: string
+): Promise<void> {
+    const resolvedTunes = resolveTuneSet(spec.tunes, existingTunes);
+    const selected = new Set<CanonicalInstrument>(spec.instruments as CanonicalInstrument[]);
+
+    // 1. Filter each tune's ODS into a temp dir.
+    const filteredOdsDir = await dir({ ...TEMP_OPTIONS, postfix: 'filtered-ods', unsafeCleanup: true });
+    const survivingTunes: string[] = [];
+    const filteredOdsPaths: string[] = [];
+    for (const tune of resolvedTunes) {
+        const inputResult = await globby(`${inDir}/${tune}.ods`);
+        if (inputResult.length !== 1) continue;  // .odt files (text-only) don't have instrument rows; skip filtering
+        const inputOds = inputResult[0];
+        const outputOds = `${filteredOdsDir.path}/${tune}.ods`;
+        const result = await filterOdsByInstruments(inputOds, outputOds, selected);
+        if (result.unknownLabels.length > 0) {
+            console.log(`[filter] ${tune}: unknown column-A labels (kept as 'other'): ${result.unknownLabels.join(', ')}`);
+        }
+        if (result.keptInstrumentRows === 0 && result.keptBreakRows === 0) {
+            console.log(`[filter] dropping ${tune} — no instrument rows match selection and no break sections`);
+            continue;
+        }
+        survivingTunes.push(tune);
+        filteredOdsPaths.push(outputOds);
+    }
+
+    if (survivingTunes.length === 0) {
+        throw new Error("Instrument filter eliminated every tune. Try selecting more instruments.");
+    }
+
+    // 2. Convert filtered ODS files to PDFs.
+    const tunePdfsDir = await dir({ ...TEMP_OPTIONS, postfix: 'filtered-pdfs', unsafeCleanup: true });
+    await convertOdToPdf(filteredOdsPaths, tunePdfsDir.path);
+
+    // 3. Crop each PDF to its actual content (removes blank tail from row deletion).
+    const croppedPdfs: string[] = [];
+    const sortedTunes = sortTunes(new Set(survivingTunes));
+    for (const tune of sortedTunes) {
+        const src = `${tunePdfsDir.path}/${tune}.pdf`;
+        const dst = `${tunePdfsDir.path}/${tune}-cropped.pdf`;
+        await cropPdfToContent(src, dst);
+        croppedPdfs.push(dst);
+    }
+
+    // 4. Pack multiple cropped tunes onto pages of the target booklet's tune-page size.
+    const packedPdf = await file({ ...TEMP_OPTIONS, postfix: 'packed.pdf' });
+    await packTunesIntoPages(croppedPdfs, spec.format, packedPdf.path);
+
+    // 5. Build covers — show the tune list without per-tune page numbers.
+    const indexEntries = sortedTunes.map((t) => ({ displayName: TUNE_DISPLAY_NAME(t), page: '' }));
+    const frontPdf = await generateCoverPdf(inDir, FRONT(spec, existingTunes), spec.tunes, indexEntries, commitId);
+    const backPdf = await generateCoverPdf(inDir, BACK(spec, existingTunes), spec.tunes, indexEntries, commitId);
+
+    // 6. Assemble [front, packed, blanks..., back] and add blanks to satisfy booklet binding.
+    const packedPages = await getNumberOfPages(packedPdf.path);
+    const target = spec.format === SheetFormat.A4 ? 2 : 4;
+    const totalIncludingCovers = packedPages + 2;
+    const blanksNeeded = (target - (totalIncludingCovers % target)) % target;
+
+    const files: string[] = [frontPdf.path, packedPdf.path, ...new Array(blanksNeeded).fill(BLANK), backPdf.path];
+
+    // 7. Concatenate and impose using existing pipeline.
+    if (spec.format === SheetFormat.A4) {
+        await concatPdfsToPortraitA4WithPageNumbers(files, spec.outFile);
+    } else {
+        const a4BookletPdf = await file({ ...TEMP_OPTIONS, postfix: 'a4.pdf' });
+        await concatPdfsToPortraitA4WithPageNumbers(files, a4BookletPdf.path);
+        try {
+            await (spec.format === SheetFormat.A5 ? scalePdfToA5Booklet : scalePdfToA6Booklet)(a4BookletPdf.path, spec.outFile);
+        } finally {
+            if (!process.env.KEEP_TEMP) {
+                await a4BookletPdf.cleanup();
+            }
+        }
+    }
+
+    if (!process.env.KEEP_TEMP) {
+        await Promise.all([
+            frontPdf.cleanup(),
+            backPdf.cleanup(),
+            packedPdf.cleanup(),
+            tunePdfsDir.cleanup(),
+            filteredOdsDir.cleanup()
+        ]);
     }
 }
 
@@ -108,12 +228,6 @@ async function generateTunePdfs(inDir: string, tunes: Set<string>): Promise<Dire
  * @return The temporary file containing the cover PDF. Call the cleanup method when you are done.
  */
 async function generateFrontOrBackPdf(inDir: string, which: string, tunes: string | string[], orderedTunes: string[], pageNumbers: Map<string, number>, commitId: string): Promise<FileResult> {
-    const [svgTemplate, tmpSvg, result] = await Promise.all([
-        fs.readFile(`${inDir}/${which}.svg`).then((b) => b.toString('utf8')),
-        file({ ...TEMP_OPTIONS, postfix: `${which}.svg` }),
-        file({ ...TEMP_OPTIONS, postfix: `${which}.pdf` })
-    ]);
-
     let totalPages = 0;
     const index = orderedTunes.flatMap((t) => {
         if (t === BLANK) {
@@ -125,9 +239,30 @@ async function generateFrontOrBackPdf(inDir: string, which: string, tunes: strin
         totalPages += pageNumbers.get(t)!;
         return [{
             displayName: TUNE_DISPLAY_NAME(t),
-            page
+            page: String(page)
         }];
     });
+
+    return generateCoverPdf(inDir, which, tunes, index, commitId);
+}
+
+/**
+ * Render a cover PDF from the SVG template, with arbitrary pre-built index entries.
+ * `page` may be an empty string when page-by-page mapping is unknown (e.g. filtered booklets
+ * where multiple tunes share a packed page).
+ */
+async function generateCoverPdf(
+    inDir: string,
+    which: string,
+    tunes: string | string[],
+    index: Array<{ displayName: string; page: string }>,
+    commitId: string
+): Promise<FileResult> {
+    const [svgTemplate, tmpSvg, result] = await Promise.all([
+        fs.readFile(`${inDir}/${which}.svg`).then((b) => b.toString('utf8')),
+        file({ ...TEMP_OPTIONS, postfix: `${which}.svg` }),
+        file({ ...TEMP_OPTIONS, postfix: `${which}.pdf` })
+    ]);
 
     const svg = svgTemplate
         .replace(/\[month\]/g, dayjs().format("MMMM YYYY"))
@@ -136,7 +271,6 @@ async function generateFrontOrBackPdf(inDir: string, which: string, tunes: strin
         .replace(/\[pages\]/g, `</tspan>${index.map((t, i) => `<tspan x="0" dy="${i === 0 ? '1.5em' : '1em'}">${t.page}`).join('</tspan>')}`);
 
     await fs.writeFile(tmpSvg.path, svg, { encoding: 'utf8' });
-
     await convertSvgToPdf(tmpSvg.path, result.path);
 
     if (!process.env.KEEP_TEMP) {

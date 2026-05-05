@@ -2,9 +2,17 @@ import { $ } from "zx";
 import { dir, file } from "tmp-promise";
 import { TEMP_OPTIONS } from "../../config";
 import { promises as fs } from "fs";
+import { SheetFormat } from "ror-sheetbook-common";
 
 /** Represents an empty page. */
 export const BLANK = 'blank';
+
+/** Portrait page dimensions in millimetres for each booklet format's tune-page size. */
+const PACKED_PAGE_DIMENSIONS_MM: Record<SheetFormat, { width: number; height: number }> = {
+    [SheetFormat.A4]: { width: 210, height: 297 },
+    [SheetFormat.A5]: { width: 148, height: 210 },
+    [SheetFormat.A6]: { width: 105, height: 148 }
+};
 
 /**
  * Convert one or multiple ODT or ODS files to PDF.
@@ -153,6 +161,56 @@ export async function concatPdfsToPortraitA4WithPageNumbers(inFiles: string[], o
 
 \\begin{document}
     ${inFiles.map((f, i) => f === BLANK ? '\\null\\newpage' : `\\addpdf${i === 0 || i === inFiles.length - 1 ? '[empty]' : ''}{${f}}`).join('\n    ')}
+\\end{document}
+`, outFile);
+}
+
+/**
+ * Crop a PDF to its visible content's bounding box, with a small margin. Used in the
+ * instrument-filter pipeline to remove blank tail/right-side that would otherwise
+ * appear after instrument rows are deleted from a tune.
+ *
+ * @param inFile The path of the PDF file to crop
+ * @param outFile The path of the cropped PDF to be generated
+ */
+export async function cropPdfToContent(inFile: string, outFile: string): Promise<void> {
+    await $`pdfcrop --margins "2 2 2 2" --hires ${inFile} ${outFile}`;
+}
+
+/**
+ * Pack a list of (already-cropped) tune PDFs onto pages of the target booklet's
+ * tune-page size, letting LaTeX flow them with automatic page breaks. Each tune
+ * is rotated to portrait if needed and scaled to the page width. A horizontal
+ * rule separates consecutive tunes on the same page.
+ *
+ * @param inFiles Cropped tune PDF paths in the order they should appear
+ * @param format Target booklet format — determines packed page size (A6/A5/A4 portrait)
+ * @param outFile The path of the packed PDF to be generated
+ */
+export async function packTunesIntoPages(inFiles: string[], format: SheetFormat, outFile: string): Promise<void> {
+    if (inFiles.length === 0) {
+        throw new Error("packTunesIntoPages: no input files");
+    }
+    const { width, height } = PACKED_PAGE_DIMENSIONS_MM[format];
+    // Pack onto portrait pages of the booklet's tune-page size. Each tune is scaled
+    // to fit the page width (max=\textwidth), preserving its natural orientation —
+    // landscape tunes stay wide-and-short so several can stack on one portrait page.
+    // \\setkeys{Gin} caps height too in case a single tune is taller than the page.
+    await runPdfLatex(
+`\\documentclass{article}
+\\usepackage[paperheight=${height}mm,paperwidth=${width}mm,top=4mm,bottom=4mm,left=4mm,right=4mm]{geometry}
+\\usepackage{graphicx}
+\\setlength{\\parindent}{0pt}
+\\setlength{\\parskip}{0pt}
+\\pagestyle{empty}
+\\setkeys{Gin}{width=\\textwidth,height=\\textheight,keepaspectratio}
+
+\\newcommand{\\addtune}[1]{%
+    \\includegraphics{#1}\\par\\vspace{2mm}\\hrule\\vspace{2mm}%
+}
+
+\\begin{document}
+    ${inFiles.map((f) => `\\addtune{${f}}`).join('\n    ')}
 \\end{document}
 `, outFile);
 }

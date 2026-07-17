@@ -27,7 +27,9 @@
   },
   "resolutions": {
     "@types/glob": "^8.1.0",
-    "@types/express": "^4.17.25"
+    "@types/express": "^4.17.25",
+    "@types/node": "25.7.0",
+    "serialize-javascript": "^7.0.3"
   },
   "version": "1.0.0"
 }
